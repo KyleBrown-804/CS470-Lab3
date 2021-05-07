@@ -4,17 +4,20 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include<stdatomic.h>
 
 #define ERROR_MESSAGE "The program exited with code 1\n\n"
 
-struct teammate {
-    int xcoor, ycoor;
-    char teamSide;
-};
+atomic_int endGame = 0;
+pthread_mutex_t mLock;
 
-void *teamMember(void *arg) {
-    struct teammate *tMem = (struct teammate *)arg;
-}
+// Process memory to share with the current process's multiple threads
+struct processMemory {
+    FILE * mFile;
+    int numSpaces;
+    int rows;
+    int cols;
+};
 
 // check for valid logical inputs in command line args
 int *checkCommand(int numArgs, char *args[]) {
@@ -48,29 +51,18 @@ int *checkCommand(int numArgs, char *args[]) {
     return validArgs;
 }
 
-// this function is from:
-// https://stackoverflow.com/questions/1202687/how-do-i-get-a-specific-range-of-numbers-from-rand
-int genRandom(int min, int max){
-   srand(time(NULL));
-   return min + rand() / (RAND_MAX / (max - min + 1) + 1);
-}
-
-void writeToBinary(int rows, int cols, FILE *fptr, unsigned char **board) {
-    fseek(fptr, 0, SEEK_SET);
-
-    for (int i = 0; i < rows; i++) {
-        fwrite(board[i], sizeof(unsigned char *), cols, fptr);
-    }
-    
-}
-
-/* Generates the map initially to 0's for unoccupied then populates
+/* 
+*  Generates the map initially to 0's for unoccupied then populates
 *  Team A and Team B members in random locations without overlapping.
+*  Saves original bases indicies to memory as a reference to not change later.
 */
-void generateMap(int* gameArgs, int numSpaces, FILE *fptr, unsigned char **board) {
-    
+void generateMap(int* gameArgs, int* resBases, FILE* fptr) {
     int rows = gameArgs[2];
     int columns = gameArgs[3];
+    int numSpaces = rows * columns;
+    int numTeamA = gameArgs[0];
+    int numTeamB = gameArgs[1];
+    srand(time(NULL)); // Sets random seed once for efficiency
 
     // Initializing Map spaces to 0 for 'unoccupied'
     unsigned char buffer[numSpaces];
@@ -78,51 +70,99 @@ void generateMap(int* gameArgs, int numSpaces, FILE *fptr, unsigned char **board
         buffer[i] = 0;
     }
 
-    fwrite(buffer, sizeof(buffer), 1, fptr);
-
-    // Generates random locations for Team A
-    int numTeamA = gameArgs[0];
     while (numTeamA > 0) {
-        int xcoor = genRandom(0, (rows - 1)); // 0 <= i < M
-        int ycoor = genRandom(0, (columns - 1)); // 0 <= j < N
-        
-        if (board[xcoor][ycoor] == 0) {
-            board[xcoor][ycoor] = 0xa;
-            numTeamA -= 1;
+        int loc = rand() % numSpaces;
+        if (buffer[loc] == 0) {
+            buffer[loc] = 0xA;
+            --numTeamA;
         }
     }
 
-    // Generates random locations for Team B
-    int numTeamB = gameArgs[1];
     while (numTeamB > 0) {
-        int xcoor = genRandom(0, (rows - 1)); // 0 <= i < M
-        int ycoor = genRandom(0, (columns - 1)); // 0 <= j < N
-        
-        if (board[xcoor][ycoor] == 0) {
-            board[xcoor][ycoor] = 0xb;
-            numTeamB -= 1;
+        int loc = rand() % numSpaces;
+        if (buffer[loc] == 0) {
+            buffer[loc] = 0xB;
+            --numTeamB;
         }
     }
 
-    writeToBinary(rows, columns, fptr, board);
-
-
-    printf("Wrote 2D array to binary file!\n");
-
-    // PRINTING 2D ARRAY TESTING BOARD
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < columns; j++) {
-            printf("%x ", board[i][j]);
-                    
-            if (j+1 == columns)
-                printf("\n");
+    // Saving the indicies of reserved (non-conquerable) bases
+    int resIndex = 0;
+    for (int i = 0; i < numSpaces; i++) {
+        if (buffer[i] != 0) {
+            resBases[resIndex] = i;
+            ++resIndex;
         }
     }
 
+    fwrite(buffer, sizeof(unsigned char), numSpaces, fptr);
 }
 
-// Command line arguments are:
-// #TeamA, #TeamB, M-rows, N-columns
+// The supervisor thread process which signals to others the game has ended
+void* supervisorThread(void* arg) {
+
+    struct processMemory *pMem = (struct processMemory *) arg;
+    unsigned char buffer[pMem->numSpaces];
+
+    printf("I am Supervisor thread [#%ld] \n", (long)pthread_self());
+    fflush(stdout);
+
+    while (endGame != 1) {
+
+        pthread_mutex_lock(&mLock);
+
+            fseek(pMem->mFile, 0, SEEK_SET);
+            fread(buffer, sizeof(buffer), 1, pMem->mFile);
+
+        pthread_mutex_unlock(&mLock);
+
+        int numOccupied = 0;
+
+        for (int i = 0; i < pMem->numSpaces; i++) {
+            if (buffer[i] != 0) {
+                ++numOccupied;
+            }
+        }
+
+        if (numOccupied == pMem->numSpaces)
+            endGame = 1;
+    }
+
+    return (void*)0;
+}
+
+// Team member missile firing thread function
+void* fireMissile(void* arg) {
+
+    struct processMemory *pMem = (struct processMemory *) arg;
+    unsigned char buffer[pMem->numSpaces];
+
+    printf("I am thread [#%ld] \n", (long)pthread_self());
+    fflush(stdout);
+    
+    // As long as supervisor thread has not issued exit
+    while (endGame != 1) {
+
+        // Generate Missile coordinate
+        int missileCoor = rand() % pMem->numSpaces;
+
+        // Only one process at a time can write to the map file (for testing)
+        pthread_mutex_lock(&mLock);
+
+            // for 3 rows (need to calculate locations to move to)
+                // Seek the start of the lock region? (3x3 matrix range)
+                // read in 3 values
+
+            // buffer is of size 9 and now contains region
+
+            // use pread() and pwrite() and lseek() for efficiency and less sys calls?
+
+        pthread_mutex_unlock(&mLock);
+    }
+
+    return (void*)0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 5) {
         printf("Insufficient number of arguments!\nA file name must be provided after the program name.\n%s", ERROR_MESSAGE);
@@ -148,21 +188,13 @@ int main(int argc, char *argv[]) {
             int rows = gameArgs[2];
             int columns = gameArgs[3];
             int numSpaces = rows * columns;
+            int numResBases = gameArgs[0] + gameArgs[1];
             
-            // 2D array used to display the simulation in standard output
-            // https://www.geeksforgeeks.org/dynamically-allocate-2d-array-c/ 
-            unsigned char **gameBoard = (unsigned char **) malloc(rows * sizeof(unsigned char *));
-            for (int i = 0; i < rows; i++)
-                gameBoard[i] = (unsigned char *) malloc(columns * sizeof(unsigned char *));
+            // Holds the original bases which cannot be destroyed/conquered
+            int *reservedBases = malloc(numResBases * sizeof(int));
+            generateMap(gameArgs, reservedBases, mapFile);
 
-            for (int i = 0; i < rows; i++)
-                for (int j = 0; j < columns; j++)
-                    gameBoard[i][j] = 0;
-
-            generateMap(gameArgs, numSpaces, mapFile, gameBoard);
-
-
-            // RESET FILE POINTER AND TEST READING
+            // PRINT FILE CONTENTS AFTER INITIALIZATION
             unsigned char resbuffer[numSpaces];
             fseek(mapFile, 0, SEEK_SET);
             fread(resbuffer, sizeof(resbuffer), 1, mapFile);
@@ -177,18 +209,42 @@ int main(int argc, char *argv[]) {
 
             // [ ----- Thread town ----- ]
             // Allocate threads for team A & B members
+            srand(time(NULL)); // Generate new seed for missile locations (once for efficiency)
+            pthread_t supervisor;
             pthread_t teamA[gameArgs[0]];
             pthread_t teamB[gameArgs[1]];
+            int sVal;
+            int aVal;
+            int bVal;
+
+            // Initializing process memory to pass for threads to use
+            struct processMemory pMem;
+            pMem.mFile = mapFile;
+            pMem.numSpaces = numSpaces;
+            pMem.rows = rows;
+            pMem.cols = columns;
+
+            printf("Starting thread executions\n");
+            sVal = pthread_create(&supervisor, NULL, supervisorThread, &pMem);
+
+            for (int i = 0; i < gameArgs[0]; i++)
+                aVal = pthread_create(&teamA[i], NULL, fireMissile, &pMem);
+
+            for (int i = 0; i < gameArgs[1]; i++)
+                bVal = pthread_create(&teamB[i], NULL, fireMissile, &pMem);
+
+            for (int i = 0; i < gameArgs[0]; i++)
+                pthread_join(teamA[i], NULL);
+            
+            for (int i = 0; i < gameArgs[0]; i++)
+                pthread_join(teamB[i], NULL);
+
+            pthread_join(supervisor, NULL);
 
             // [ ----- Deallocations ----- ]
-            for (int i = 0; i < rows; i++) {
-                free(gameBoard[i]);
-                gameBoard[i] = NULL;
-            }
+            free(reservedBases);
+            reservedBases = NULL;
 
-            free(gameBoard);
-            gameBoard = NULL;
-            
             free(gameArgs);
             gameArgs = NULL;
         }
