@@ -17,6 +17,7 @@ struct processMemory {
     int numSpaces;
     int rows;
     int cols;
+    // unsigned char teamSign;
 };
 
 // check for valid logical inputs in command line args
@@ -48,7 +49,128 @@ int *checkCommand(int numArgs, char *args[]) {
         exit(1);
     }
 
+    // Make sure columns > 1 
+
     return validArgs;
+}
+
+// Checks if space in vacinity is valid concerning edges and corners
+int isValidSpace(int misX, int misY, int cols, int otherLoc) {
+    int xCoor = otherLoc % cols;
+    int yCoor = otherLoc / cols;
+
+    // All vicinity range should be at most 1 away from missile landing
+    if (abs(misX - xCoor) <= 1 && abs(misY - yCoor) <= 1)
+        return 1;
+    else
+        return 0;
+}
+
+// Handles reading in the vicinity during a missile strike
+unsigned char *readVicinity(int misLoc, int cols, int rows, unsigned char team, FILE *fptr) {
+    
+    unsigned char blastLoc;
+    unsigned char enemy;
+    fseek(fptr, misLoc, SEEK_SET);
+    fread(&blastLoc, sizeof(unsigned char), 1, fptr);
+    
+    if (team == 0xaa || team == 0xaf)
+        enemy = 0xbb;
+    else
+        enemy = 0xaa;
+
+    // Checks if blast spot is non-conquerable and returns since the missile fails
+    // otherwise assigns to appropriate team or relinquishes if friendly fire
+    if (blastLoc == 0xaf || blastLoc == 0xbf)
+        return NULL;
+    else if (blastLoc == team)
+        blastLoc = 0;
+    else
+        blastLoc = team;
+    
+    // [ ---------- Start of vicinity checking ---------- ]
+    int vicinity[] = {(misLoc-cols)-1, misLoc-cols, (misLoc-cols)+1, misLoc-1, misLoc, misLoc+1, (misLoc+cols)-1, misLoc+cols, (misLoc+cols)+1};
+    int numSpaces = cols * rows;
+    int xCoor = misLoc % cols;
+    int yCoor = misLoc / cols;
+    int safeLocs = 0;
+        
+    for (int i = 0; i < 9; i++) {
+        if (vicinity[i] < 0 || vicinity[i] >= numSpaces)
+            vicinity[i] = -1;
+        else if (! isValidSpace(xCoor, yCoor, cols, vicinity[i]))
+            vicinity[i] = -1;
+        else if (i > 0) {
+            // Edge case for handling skinny arrays such as 2 width
+            if (vicinity[i] == vicinity[i-1])
+                vicinity[i] = -1;
+            else
+                safeLocs++;
+        }
+        else
+            safeLocs++;
+    }
+
+    int bombRange[safeLocs];
+    for (int i = 0, j = 0; i < 9; i++) {
+        if (vicinity[i] != -1) {
+            bombRange[j] = vicinity[i];
+            j++;
+        }
+    }
+
+    // [NOTE] ONLY READS IN CRITICAL SECITON TO AVOID OVERLAP DEADLOCKS
+    // For all safe spaces to index, loads in bytes from file into bomb range
+    unsigned char *buffer = malloc(safeLocs * sizeof(unsigned char));
+    for (int i = 0; i < safeLocs; i++) {
+        if (bombRange[i] == misLoc) {
+            buffer[i] = blastLoc;
+            continue;
+        }
+        fseek(fptr, bombRange[i], SEEK_SET);
+        fread(&buffer[i], sizeof(unsigned char), 1, fptr);
+    }
+
+    // Counts to determine if either team is routed (overrun) by majority team
+    int numA = 0, numB = 0, unocc = 0;
+    for (int i = 0; i < safeLocs; i++) {
+        if (buffer[i] == 0xaa || buffer[i] == 0xaf)
+            numA++;
+        else if (buffer[i] == 0xbb || buffer[i] == 0xbf)
+            numB++;
+        else
+            unocc++;
+    }
+
+    printf("Num A: %d\t Num B: %d\t Num unoccupied %d\n", numA, numB, unocc);
+
+    // Returns early if both teams have equal hold
+    if (numA == numB)
+        return buffer;
+
+    // Both checks are made to ONLY route the enemy if the
+    // majority around (k, l) and (k, l) itself are now occupied
+    // by the "team who sent the missile". The logic below assures 
+    // that the enemy doesn't take majority if they weren't firing
+    if (team == 0xaa || team == 0xaf) {
+        if (numA > numB) {
+            for (int i = 0; i < safeLocs; i++) {
+                if (buffer[i] != 0xaf && buffer[i] != 0xbf) {
+                    buffer[i] = team;
+                }
+            }
+        }
+    }
+    else if(team == 0xbb || team == 0xbf) {
+        if (numB > numA) {
+            for (int i = 0; i < safeLocs; i++) {
+                if (buffer[i] != 0xaf && buffer[i] != 0xbf) {
+                    buffer[i] = team;
+                }
+            }
+        }
+    }
+    return buffer;
 }
 
 /* 
@@ -73,7 +195,7 @@ void generateMap(int* gameArgs, int* resBases, FILE* fptr) {
     while (numTeamA > 0) {
         int loc = rand() % numSpaces;
         if (buffer[loc] == 0) {
-            buffer[loc] = 0xA;
+            buffer[loc] = 0xaf;
             --numTeamA;
         }
     }
@@ -81,7 +203,7 @@ void generateMap(int* gameArgs, int* resBases, FILE* fptr) {
     while (numTeamB > 0) {
         int loc = rand() % numSpaces;
         if (buffer[loc] == 0) {
-            buffer[loc] = 0xB;
+            buffer[loc] = 0xbf;
             --numTeamB;
         }
     }
@@ -126,6 +248,12 @@ void* supervisorThread(void* arg) {
 
         if (numOccupied == pMem->numSpaces)
             endGame = 1;
+
+        // Sleeps the supervisor thread for half a second to allow
+        // the other threads more schedule time
+        struct timespec superWait;
+        superWait.tv_nsec = 500000000L;
+        nanosleep(&superWait, NULL);
     }
 
     return (void*)0;
@@ -146,16 +274,13 @@ void* fireMissile(void* arg) {
         // Generate Missile coordinate
         int missileCoor = rand() % pMem->numSpaces;
 
+        // Should add logic to check critical section area needed first
+        // [checkVicinity() function here]
+
         // Only one process at a time can write to the map file (for testing)
         pthread_mutex_lock(&mLock);
 
-            // for 3 rows (need to calculate locations to move to)
-                // Seek the start of the lock region? (3x3 matrix range)
-                // read in 3 values
-
-            // buffer is of size 9 and now contains region
-
-            // use pread() and pwrite() and lseek() for efficiency and less sys calls?
+            // unsigned char *resBuffer= readVicinity(missileCoor, pMem->cols, pMem->rows, pMem->teamSign, pMem->mFile);
 
         pthread_mutex_unlock(&mLock);
     }
