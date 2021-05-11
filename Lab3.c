@@ -4,6 +4,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <fcntl.h>
 #include <stdatomic.h>
 
 #define ERROR_MESSAGE "The program exited with code 1\n\n"
@@ -16,12 +17,11 @@ int cols;
 
 // Process memory to share with the current process's multiple threads
 struct processMem {
-    FILE * mFile;
     unsigned char teamSign;
     int critSectionSize;
 };
 
-// check for valid logical inputs in command line args
+// Checks for valid logical inputs in command line args
 int *checkCommand(int numArgs, char *args[]) {
     for (int i = 1; i < numArgs; i++) {
         if (!isdigit(*args[i])) {
@@ -59,6 +59,24 @@ int *checkCommand(int numArgs, char *args[]) {
     return validArgs;
 }
 
+// Prints the file contents to the terminal given a file descriptor
+void printFile(int fdesc) {
+    unsigned char resbuffer[numSpaces];
+    pread(fdesc, &resbuffer, numSpaces, 0);
+
+    printf("\n");
+    fflush(stdout);
+    for (int i = 0; i < numSpaces; i++) {
+        printf("%x ", resbuffer[i]);
+        fflush(stdout);
+        
+        if ((i + 1) % cols == 0) {
+            printf("\n");
+            fflush(stdout);
+        }
+    }
+}
+
 // Checks if space in vacinity is valid concerning edges and corners
 int isValidSpace(int misX, int misY, int otherLoc) {
     int xCoor = otherLoc % cols;
@@ -72,12 +90,10 @@ int isValidSpace(int misX, int misY, int otherLoc) {
 }
 
 // Handles reading in the vicinity during a missile strike
-unsigned char *readVicinity(int misLoc, struct processMem *pMem, int *bombRange) {
+unsigned char *readVicinity(int misLoc, struct processMem *pMem, int *bombRange, int threadFd) {
     unsigned char blastLoc;
     unsigned char enemy;
-    fseek(pMem->mFile, misLoc, SEEK_SET);
-    fread(&blastLoc, sizeof(unsigned char), 1, pMem->mFile);
-    
+    pread(threadFd, &blastLoc, 1, misLoc);
     if (pMem->teamSign == 0xaa)
         enemy = 0xbb;
     else
@@ -97,8 +113,7 @@ unsigned char *readVicinity(int misLoc, struct processMem *pMem, int *bombRange)
             buffer[i] = blastLoc;
             continue;
         }
-        fseek(pMem->mFile, bombRange[i], SEEK_SET);
-        fread(&buffer[i], sizeof(unsigned char), 1, pMem->mFile);
+        pread(threadFd, &buffer[i], 1, bombRange[i]);
     }
 
     // Counts to determine if either team is routed (overrun) by majority team
@@ -142,11 +157,10 @@ unsigned char *readVicinity(int misLoc, struct processMem *pMem, int *bombRange)
 }
 
 // Does a precheck of the range needed for the critical section read/writes
-int *checkCriticalSection(int misLoc, struct processMem *pMem) {
+int *checkCriticalSection(int misLoc, struct processMem *pMem, int threadFd) {
     // Preemptive check to see if missile lands on a non-conquerable space
     unsigned char blastLoc;
-    fseek(pMem->mFile, misLoc, SEEK_SET);
-    fread(&blastLoc, sizeof(unsigned char), 1, pMem->mFile);
+    pread(threadFd, &blastLoc, 1, misLoc);
     if (blastLoc == 0xaf || blastLoc == 0xbf)
         return NULL;
     
@@ -188,7 +202,7 @@ int *checkCriticalSection(int misLoc, struct processMem *pMem) {
 
 // Generates the map initially to 0's for unoccupied then populates
 // Team A and Team B members in random locations without overlapping.
-void generateMap(int* gameArgs, FILE* fptr) {
+void generateMap(int* gameArgs, int mapFd) {
     int numTeamA = gameArgs[0];
     int numTeamB = gameArgs[1];
     srand(time(NULL)); // Sets random seed once for efficiency
@@ -215,14 +229,16 @@ void generateMap(int* gameArgs, FILE* fptr) {
         }
     }
 
-    fwrite(buffer, sizeof(unsigned char), numSpaces, fptr);
+    //fwrite(buffer, sizeof(unsigned char), numSpaces, fptr);
+    pwrite(mapFd, &buffer, numSpaces, 0);
 }
 
 // The supervisor thread process which signals to others the game has ended
 void* supervisorThread(void* arg) {
 
-    struct processMem *pMem = (struct processMem *) arg;
+    //struct processMem *pMem = (struct processMem *) arg;
     unsigned char buffer[numSpaces];
+    int superFd = open("mapFile.bin", O_RDWR);
 
     printf("I am Supervisor thread [#%ld] \n", (long)pthread_self());
     fflush(stdout);
@@ -231,8 +247,7 @@ void* supervisorThread(void* arg) {
 
         pthread_mutex_lock(&mLock);
 
-            fseek(pMem->mFile, 0, SEEK_SET);
-            fread(buffer, sizeof(buffer), 1, pMem->mFile);
+            pread(superFd, &buffer, numSpaces, 0);
 
         pthread_mutex_unlock(&mLock);
 
@@ -247,14 +262,15 @@ void* supervisorThread(void* arg) {
         if (numOccupied == numSpaces)
             endGame = 1;
 
+        
         printf("\n[SUPERVISOR] -- spaces left: %d\n", numSpaces-numOccupied);
         fflush(stdout);
 
         // Sleeps the supervisor thread for half a second to allow
         // the other threads more schedule time (better for smaller grids)
-        // struct timespec superWait;
-        // superWait.tv_nsec = 500000000L;
-        // nanosleep(&superWait, NULL);
+        struct timespec superWait;
+        superWait.tv_nsec = 500000000L;
+        nanosleep(&superWait, NULL);
     }
 
     // After breaking the loop the game has been one
@@ -266,7 +282,7 @@ void* supervisorThread(void* arg) {
             ++numB;
     }
 
-    printf("\n[ ========== GAME OVER ========== ]\n");
+    printf("\n[ =============== GAME OVER =============== ]\n");
 
     if (numA == numB)
         printf("DRAW - Team A and B share an equal number of territory!\n");
@@ -275,7 +291,12 @@ void* supervisorThread(void* arg) {
     else
         printf("VICTORY TEAM B - Team B holds more territory and conquered Team A!\n");
 
-    printf("[ =============================== ]\n\n");
+    printf("\nEnding Game Board:\n");
+    fflush(stdout);
+    printFile(superFd);
+    printf("[ ========================================= ]\n\n");
+
+    int superStatus = close(superFd);
     return (void*)0;
 }
 
@@ -284,6 +305,7 @@ void* fireMissile(void* arg) {
 
     struct processMem *pMem = (struct processMem *) arg;
     unsigned char buffer[numSpaces];
+    int threadFd = open("mapFile.bin", O_RDWR);
 
     printf("I am thread [#%ld] \n", (long)pthread_self());
     fflush(stdout);
@@ -295,10 +317,12 @@ void* fireMissile(void* arg) {
         int missileCoor = rand() % numSpaces;
 
         // Checks needed section size and indices
-        int *bombRange = checkCriticalSection(missileCoor, pMem);
+        int *bombRange = checkCriticalSection(missileCoor, pMem, threadFd);
 
         // Case where missile hit a non destroyable/conquerable space
         if (bombRange == NULL) {
+            printf("***MISSILE FAILED*** to blow up original base at index %d\n", missileCoor);
+            fflush(stdout);
             pMem->critSectionSize = 0;
             continue;
         }
@@ -307,14 +331,16 @@ void* fireMissile(void* arg) {
         // [Note] must lock for reading to avoid overlapping critical sections
         // causing deadlocks when one team overwhelms the enemy and claims the section
         pthread_mutex_lock(&mLock);
-
-            unsigned char *resBuffer = readVicinity(missileCoor, pMem, bombRange);
+            unsigned char *resBuffer = readVicinity(missileCoor, pMem, bombRange, threadFd);
 
             // Writing the contents of results buffer back into the critical section of the file
             for (int i = 0; i < pMem->critSectionSize; i++) {
-                fseek(pMem->mFile, bombRange[i], SEEK_SET);
-                fwrite(&resBuffer[i], sizeof(unsigned char), 1, pMem->mFile);
+                pwrite(threadFd, &resBuffer[i], 1, bombRange[i]);
             }
+
+            printf("***MISSILE HIT*** at index %d\n", missileCoor);
+            fflush(stdout);
+            printFile(threadFd);
 
             // clear critical section holding
             pMem->critSectionSize = 0;
@@ -325,9 +351,15 @@ void* fireMissile(void* arg) {
 
             free(resBuffer);
             resBuffer = NULL;
-
         pthread_mutex_unlock(&mLock);
+
+        // For Testing shows that each thread executes correctly
+        struct timespec threadWait;
+        threadWait.tv_nsec = 500000000L;
+        nanosleep(&threadWait, NULL);
     }
+
+    int threadFdStatus = close(threadFd);
 
     return (void*)0;
 }
@@ -344,13 +376,18 @@ int main(int argc, char *argv[]) {
     }
 
     else {
+        // Handles issues that open() has with overwriting an existing file of the same name
         FILE *mapFile = fopen("mapFile.bin", "wb+");
+        fclose(mapFile);
 
-        if (!mapFile) {
+        int mapFd = open("mapFile.bin", O_RDWR);
+
+        if (mapFd == -1) {
             printf("An error occured trying to create the map binary file\n%s", ERROR_MESSAGE);
             return 1;
         }
         else {
+            
             printf("Successfully created new binary file\n");
             
             int *gameArgs = checkCommand(argc, argv);
@@ -358,12 +395,11 @@ int main(int argc, char *argv[]) {
             cols = gameArgs[3];
             numSpaces = rows * cols;
             
-            generateMap(gameArgs, mapFile);
+            generateMap(gameArgs, mapFd);
 
             // PRINT FILE CONTENTS AFTER INITIALIZATION
             unsigned char resbuffer[numSpaces];
-            fseek(mapFile, 0, SEEK_SET);
-            fread(resbuffer, sizeof(resbuffer), 1, mapFile);
+            pread(mapFd, &resbuffer, numSpaces, 0);
 
             printf("\n");
             for (int i = 0; i < numSpaces; i++) {
@@ -373,9 +409,7 @@ int main(int argc, char *argv[]) {
                     printf("\n");
             }
 
-            // [ ----- Thread town ----- ]
             // Allocate threads for team A & B members
-            srand(time(NULL)); // Generate new seed for missile locations (once for efficiency)
             pthread_t supervisor;
             pthread_t teamAThreads[gameArgs[0]];
             pthread_t teamBThreads[gameArgs[1]];
@@ -385,22 +419,18 @@ int main(int argc, char *argv[]) {
             struct processMem superMem;
             struct processMem *teamAMem = malloc(gameArgs[0] * sizeof(*teamAMem));
             struct processMem *teamBMem = malloc(gameArgs[1] * sizeof(*teamBMem));
-            superMem.mFile = mapFile;
-            superMem.teamSign = 0xff;
 
-            for (int i = 0; i < gameArgs[0]; i++) {
-                teamAMem[i].mFile = mapFile;
+            for (int i = 0; i < gameArgs[0]; i++)
                 teamAMem[i].teamSign = 0xaa;
-            }
 
-            for (int i = 0; i < gameArgs[1]; i++) {
-                teamBMem[i].mFile = mapFile;
+            for (int i = 0; i < gameArgs[1]; i++)
                 teamBMem[i].teamSign = 0xbb;
-            }
 
+            // Generates new seed for missile locations in thread functions
+            srand(time(NULL));
 
-            printf("Starting thread executions\n");
-            sVal = pthread_create(&supervisor, NULL, supervisorThread, &superMem);
+            // Creating/Joining of supervisor and worker threads
+            sVal = pthread_create(&supervisor, NULL, supervisorThread, NULL);
 
             for (int i = 0; i < gameArgs[0]; i++)
                 aVal = pthread_create(&teamAThreads[i], NULL, fireMissile, &teamAMem[i]);
@@ -427,11 +457,11 @@ int main(int argc, char *argv[]) {
             gameArgs = NULL;
         }
 
-        int fErrStatus = fclose(mapFile);
-
-        if (fErrStatus != 0)
+        int mapCloseStatus = close(mapFd);
+        
+        if (mapCloseStatus == -1)
             printf("%s\n", ERROR_MESSAGE);
 
-        return fErrStatus;
+        return mapCloseStatus;
     }
 }
