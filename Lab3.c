@@ -1,3 +1,9 @@
+/*
+* Kyle Brown
+* 5/12/2021
+* CS470 Operating Systems
+*/
+#define _GNU_SOURCE // Need to define at the top in order to use OFD (open file descriptor) locks
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -7,6 +13,7 @@
 #include <fcntl.h>
 #include <stdatomic.h>
 
+// Used so frequently it makes sense to declare them once
 #define ERROR_MESSAGE "The program exited with code 1\n\n"
 
 atomic_int endGame = 0;
@@ -14,6 +21,7 @@ pthread_mutex_t mLock;
 int numSpaces;
 int rows;
 int cols;
+unsigned char *endResults;
 
 // Process memory to share with the current process's multiple threads
 struct processMem {
@@ -65,16 +73,63 @@ void printFile(int fdesc) {
     pread(fdesc, &resbuffer, numSpaces, 0);
 
     printf("\n");
-    fflush(stdout);
     for (int i = 0; i < numSpaces; i++) {
-        printf("%x ", resbuffer[i]);
-        fflush(stdout);
-        
+        if (resbuffer[i] == 0) {
+            printf("%x%x ", 0, 0);
+            fflush(stdout);
+        } else {
+            printf("%x ", resbuffer[i]);
+            fflush(stdout);
+        }
+
         if ((i + 1) % cols == 0) {
             printf("\n");
             fflush(stdout);
         }
     }
+
+}
+
+// Prints results at the very end of execution to avoid late
+// threads to print after the supervisor thread
+void printEndResults() {
+
+    // Counts spaces occupied by Team A and B for who won
+    int numA = 0, numB = 0;
+    for (int i = 0; i < endResults[i]; i++) {
+        if (endResults[i] == 0xaa || endResults[i] == 0xaf)
+            ++numA;
+        else if (endResults[i] == 0xbb || endResults[i] == 0xbf)
+            ++numB;
+    }
+
+    printf("\n[ =============== GAME OVER =============== ]\n");
+
+    if (numA == numB) {
+        printf("DRAW - Team A and B share an equal number of territory!\n");
+    }
+    else if (numA > numB) {
+        printf("VICTORY TEAM A - Team A holds more territory and conquered Team B!\n");
+    }
+    else {
+        printf("VICTORY TEAM B - Team B holds more territory and conquered Team A!\n");
+    }
+    printf("[ ========================================= ]\n\n");
+    printf("[ =============== ENDING BOARD =============== ]\n\n");
+
+    for (int i = 0; i < numSpaces; i++) {
+        if (endResults[i] == 0) {
+            printf("%x%x ", 0, 0);
+        } else {
+            printf("%x ", endResults[i]);
+        }
+
+        if ((i + 1) % cols == 0) {
+            printf("\n");
+        }
+    }
+
+    printf("[ ============================================= ]\n\n");
 }
 
 // Checks if space in vacinity is valid concerning edges and corners
@@ -104,7 +159,7 @@ unsigned char *readVicinity(int misLoc, struct processMem *pMem, int *bombRange,
         blastLoc = 0;
     else if (blastLoc == enemy || blastLoc == 0)
         blastLoc = pMem->teamSign;
-    
+
     // [NOTE] ONLY READS IN CRITICAL SECITON TO AVOID OVERLAP DEADLOCKS
     // For all safe spaces to index, loads in bytes from file into bomb range
     unsigned char *buffer = malloc((pMem->critSectionSize) * sizeof(unsigned char));
@@ -133,8 +188,8 @@ unsigned char *readVicinity(int misLoc, struct processMem *pMem, int *bombRange,
 
     // Both checks are made to ONLY route the enemy if the
     // majority around (k, l) and (k, l) itself are now occupied
-    // by the "team who sent the missile". The logic below assures 
-    // that the enemy doesn't take majority if they weren't firing
+    // by the "team who sent the missile". The logic below assures
+    // that the enemy doesn't take majority if they weren't the one firing
     if (pMem->teamSign == 0xaa) {
         if (numA > numB) {
             for (int i = 0; i < pMem->critSectionSize; i++) {
@@ -158,17 +213,18 @@ unsigned char *readVicinity(int misLoc, struct processMem *pMem, int *bombRange,
 
 // Does a precheck of the range needed for the critical section read/writes
 int *checkCriticalSection(int misLoc, struct processMem *pMem, int threadFd) {
+
     // Preemptive check to see if missile lands on a non-conquerable space
     unsigned char blastLoc;
     pread(threadFd, &blastLoc, 1, misLoc);
     if (blastLoc == 0xaf || blastLoc == 0xbf)
         return NULL;
-    
+
     int vicinity[] = {(misLoc-cols)-1, misLoc-cols, (misLoc-cols)+1, misLoc-1, misLoc, misLoc+1, (misLoc+cols)-1, misLoc+cols, (misLoc+cols)+1};
     int xCoor = misLoc % cols;
     int yCoor = misLoc / cols;
     int safeLocs = 0;
-        
+
     for (int i = 0; i < 9; i++) {
         if (vicinity[i] < 0 || vicinity[i] >= numSpaces)
             vicinity[i] = -1;
@@ -185,7 +241,7 @@ int *checkCriticalSection(int misLoc, struct processMem *pMem, int threadFd) {
             safeLocs++;
     }
 
-    // Allocates the size needed for the critical section and an 
+    // Allocates the size needed for the critical section and an
     // array of locations affected within the crticial section
     int *bombRange = malloc(safeLocs * sizeof(int));
     pMem->critSectionSize = safeLocs;
@@ -229,30 +285,18 @@ void generateMap(int* gameArgs, int mapFd) {
         }
     }
 
-    //fwrite(buffer, sizeof(unsigned char), numSpaces, fptr);
     pwrite(mapFd, &buffer, numSpaces, 0);
 }
 
 // The supervisor thread process which signals to others the game has ended
 void* supervisorThread(void* arg) {
-
-    //struct processMem *pMem = (struct processMem *) arg;
     unsigned char buffer[numSpaces];
     int superFd = open("mapFile.bin", O_RDWR);
 
-    printf("I am Supervisor thread [#%ld] \n", (long)pthread_self());
-    fflush(stdout);
-
     while (endGame != 1) {
-
-        pthread_mutex_lock(&mLock);
-
-            pread(superFd, &buffer, numSpaces, 0);
-
-        pthread_mutex_unlock(&mLock);
+        pread(superFd, &buffer, numSpaces, 0);
 
         int numOccupied = 0;
-
         for (int i = 0; i < numSpaces; i++) {
             if (buffer[i] != 0) {
                 ++numOccupied;
@@ -261,110 +305,180 @@ void* supervisorThread(void* arg) {
 
         if (numOccupied == numSpaces)
             endGame = 1;
-
-        
-        printf("\n[SUPERVISOR] -- spaces left: %d\n", numSpaces-numOccupied);
-        fflush(stdout);
-
-        // Sleeps the supervisor thread for half a second to allow
-        // the other threads more schedule time (better for smaller grids)
-        struct timespec superWait;
-        superWait.tv_nsec = 500000000L;
-        nanosleep(&superWait, NULL);
     }
 
-    // After breaking the loop the game has been one
-    int numA = 0, numB = 0;
-    for (int i = 0; i < buffer[i]; i++) {
-        if (buffer[i] == 0xaa || buffer[i] == 0xaf)
-            ++numA;
-        else if (buffer[i] == 0xbb || buffer[i] == 0xbf)
-            ++numB;
+    // Copies end results over to be printed after all other threads finish
+    endResults = malloc(numSpaces * sizeof(unsigned char));
+    for (int i = 0; i < numSpaces; i++) {
+        endResults[i] = buffer[i];
     }
-
-    printf("\n[ =============== GAME OVER =============== ]\n");
-
-    if (numA == numB)
-        printf("DRAW - Team A and B share an equal number of territory!\n");
-    else if (numA > numB)
-        printf("VICTORY TEAM A - Team A holds more territory and conquered Team B!\n");
-    else
-        printf("VICTORY TEAM B - Team B holds more territory and conquered Team A!\n");
-
-    printf("\nEnding Game Board:\n");
-    fflush(stdout);
-    printFile(superFd);
-    printf("[ ========================================= ]\n\n");
 
     int superStatus = close(superFd);
     return (void*)0;
 }
 
-// Team member missile firing thread function
+// Team member missile firing thread function:
+// uses a combination of mutex locking and "open file descriptor" (OFD) locks
+// in order to allow parallel thread execution to different byte ranges of a file.
 void* fireMissile(void* arg) {
 
-    struct processMem *pMem = (struct processMem *) arg;
-    unsigned char buffer[numSpaces];
-    int threadFd = open("mapFile.bin", O_RDWR);
+    // [NOTE] this function is longer solely because threads need multiple byte
+    // range section locks (2 or 3 per thread) in order to lock bomb range "vicinities"
+    // correctly since the byte ranges actually exist on a 1D buffer array from reading
+    // in from a file, not a 2D one as the board is conceptually thought of and displayed as.
 
-    printf("I am thread [#%ld] \n", (long)pthread_self());
-    fflush(stdout);
-    
-    // As long as supervisor thread has not issued exit
+    struct processMem *pMem = (struct processMem *) arg;
+
+    // As long as supervisor thread has not issued exit signal, keeps looping
     while (endGame != 1) {
+
+        int threadFd = open("mapFile.bin", O_RDWR);
 
         // Generate Missile coordinate
         int missileCoor = rand() % numSpaces;
 
-        // Checks needed section size and indices
+        // Pre-Checks needed section size and indices
         int *bombRange = checkCriticalSection(missileCoor, pMem, threadFd);
 
         // Case where missile hit a non destroyable/conquerable space
         if (bombRange == NULL) {
-            printf("***MISSILE FAILED*** to blow up original base at index %d\n", missileCoor);
+            printf("\n***MISSILE FAILED*** to blow up original base at index %d\n", missileCoor);
             fflush(stdout);
             pMem->critSectionSize = 0;
             continue;
         }
 
-        // Locking critical section for reading/writing to section
-        // [Note] must lock for reading to avoid overlapping critical sections
-        // causing deadlocks when one team overwhelms the enemy and claims the section
-        pthread_mutex_lock(&mLock);
-            unsigned char *resBuffer = readVicinity(missileCoor, pMem, bombRange, threadFd);
+        // Setting up locking file section lock range (at most requires 3 locks per thread)
+        struct flock toplock;
+        struct flock midlock;
+        struct flock bottomlock;
+        int topEnd = 0, midStart = 0, midEnd = 0, bottomStart = 0;
+        int topStart = bombRange[0];
+        int bottomEnd = bombRange[pMem->critSectionSize-1];
 
-            // Writing the contents of results buffer back into the critical section of the file
-            for (int i = 0; i < pMem->critSectionSize; i++) {
-                pwrite(threadFd, &resBuffer[i], 1, bombRange[i]);
+        // Gets the number of rows the bomb vicinity occupies
+        int topRow = bombRange[0] / cols;
+        int bottomRow = bombRange[pMem->critSectionSize-1] / cols;
+        int numRows = (bottomRow - topRow) + 1;
+
+        // On any sized grid there are only ever 2 or 3 rows
+        if (numRows == 2) {
+            for (int i = 1; i < pMem->critSectionSize; i++) {
+                if ((bombRange[i] / cols) > topRow) {
+                    topEnd = bombRange[i-1];
+                    bottomStart = bombRange[i];
+                    break;
+                }
+            }
+        } else {
+            int midRow = topRow+1;
+            for (int i = 1; i < pMem->critSectionSize; i++) {
+                if ((bombRange[i] / cols) == midRow) {
+                    midStart = bombRange[i];
+                    topEnd = bombRange[i-1];
+                    break;
+                }
+            }
+            for (int i = 1; i < pMem->critSectionSize; i++) {
+                if ((bombRange[i] / cols) == bottomRow) {
+                    bottomStart = bombRange[i];
+                    midEnd = bombRange[i-1];
+                    break;
+                }
+            }
+        }
+
+        // Sets byte ranges for each row [start, end] such as [0, 2]
+        toplock.l_whence = SEEK_SET;
+        toplock.l_start = topStart;
+        toplock.l_len = topEnd;
+        toplock.l_pid = 0;
+        bottomlock.l_whence = SEEK_SET;
+        bottomlock.l_start = bottomStart;
+        bottomlock.l_len = bottomEnd;
+        bottomlock.l_pid = 0;
+
+        if (numRows == 3) {
+            midlock.l_whence = SEEK_SET;
+            midlock.l_start = midStart;
+            midlock.l_len - midEnd;
+            midlock.l_pid = 0;
+        }
+
+        // The open file descriptors must be mutex locked to avoid deadlocks with multiple locks per thread
+        pthread_mutex_lock(&mLock);
+
+            // Locking the critical section for reading/writing to a section (sectioned file locking by byte range)
+            // Reference on why the new "F_OFD_SETLKW" works for multi-threading while the old posix version does
+            // not: https://gavv.github.io/articles/file-locks/#open-file-description-locks-fcntl
+
+            // more info / proof this works for multi-threading:
+            // https://www.gnu.org/software/libc/manual/html_node/Open-File-Description-Locks.html#Open-File-Description-Locks
+
+            // [NOTE] F_OFD_SETLFW forces a thread needing access to the same section
+            // to wait meanwhile non-conflicting sections may continue.
+            toplock.l_type = F_WRLCK;
+            bottomlock.l_type = F_WRLCK;
+            fcntl(threadFd, F_OFD_SETLKW, &toplock);
+            fcntl(threadFd, F_OFD_SETLKW, &bottomlock);
+
+            if (numRows == 3) {
+                midlock.l_type = F_WRLCK;
+                fcntl(threadFd, F_OFD_SETLKW, &midlock);
             }
 
-            printf("***MISSILE HIT*** at index %d\n", missileCoor);
-            fflush(stdout);
-            printFile(threadFd);
-
-            // clear critical section holding
-            pMem->critSectionSize = 0;
-
-            // Deallocations
-            free(bombRange);
-            bombRange = NULL;
-
-            free(resBuffer);
-            resBuffer = NULL;
+            // [ --- FILE SECTION LOCKED --- ]
+            // now a given thread is OFD locked meaning other threads which try to use
+            // fcntl() on the same byte section will be blocked and must wait for that section
         pthread_mutex_unlock(&mLock);
 
-        // For Testing shows that each thread executes correctly
+        // Reading in vicinity and then writing the contents of updated vicinity back into
+        // the critical section of the file
+        unsigned char *resultBuffer = readVicinity(missileCoor, pMem, bombRange, threadFd);
+        for (int i = 0; i < pMem->critSectionSize; i++) {
+            lseek(threadFd, bombRange[i], SEEK_SET);
+            write(threadFd, &resultBuffer[i], 1);
+        }
+
+        printf("\n*** MISSILE HIT *** at index %d\n", missileCoor);
+        fflush(stdout);
+        printFile(threadFd);
+
+        // Clears section size for next iteration
+        pMem->critSectionSize = 0;
+
+        // [ ----- Deallocations ----- ]
+        free(bombRange);
+        bombRange = NULL;
+        free(resultBuffer);
+        resultBuffer = NULL;
+
+        // Unlocking the file section and closing the file descriptor instance
+        toplock.l_type = F_UNLCK;
+        bottomlock.l_type = F_UNLCK;
+        fcntl (threadFd, F_OFD_SETLK, &toplock);
+        fcntl (threadFd, F_OFD_SETLK, &bottomlock);
+
+        if (numRows == 3) {
+            midlock.l_type = F_UNLCK;
+            fcntl (threadFd, F_OFD_SETLK, &midlock);
+        }
+
+        int threadFdStatus = close(threadFd);
+
+        // Allows other threads to be chosen more often from the ready queue
+        // Also allows good visual representation of each threads execution
+        // This is 1/4 of a second, increase to slow down printing if needed
         struct timespec threadWait;
-        threadWait.tv_nsec = 500000000L;
+        threadWait.tv_nsec = 250000000L;
         nanosleep(&threadWait, NULL);
     }
-
-    int threadFdStatus = close(threadFd);
 
     return (void*)0;
 }
 
 int main(int argc, char *argv[]) {
+
     if (argc < 5) {
         printf("Insufficient number of arguments!\nA file name must be provided after the program name.\n%s", ERROR_MESSAGE);
         return 1;
@@ -381,35 +495,31 @@ int main(int argc, char *argv[]) {
         fclose(mapFile);
 
         int mapFd = open("mapFile.bin", O_RDWR);
-
         if (mapFd == -1) {
             printf("An error occured trying to create the map binary file\n%s", ERROR_MESSAGE);
             return 1;
         }
         else {
-            
-            printf("Successfully created new binary file\n");
-            
+            printf("[ ----- Starting the game! ----- ]\n\n");
+
             int *gameArgs = checkCommand(argc, argv);
             rows = gameArgs[2];
             cols = gameArgs[3];
             numSpaces = rows * cols;
-            
+
             generateMap(gameArgs, mapFd);
 
-            // PRINT FILE CONTENTS AFTER INITIALIZATION
+            // Prints intial game board with original non-changeable bases
             unsigned char resbuffer[numSpaces];
             pread(mapFd, &resbuffer, numSpaces, 0);
-
-            printf("\n");
             for (int i = 0; i < numSpaces; i++) {
                 printf("%x ", resbuffer[i]);
-                
+
                 if ((i + 1) % cols == 0)
                     printf("\n");
             }
 
-            // Allocate threads for team A & B members
+            // Allocate threads for team A & B members and supervisor
             pthread_t supervisor;
             pthread_t teamAThreads[gameArgs[0]];
             pthread_t teamBThreads[gameArgs[1]];
@@ -440,7 +550,7 @@ int main(int argc, char *argv[]) {
 
             for (int i = 0; i < gameArgs[0]; i++)
                 pthread_join(teamAThreads[i], NULL);
-            
+
             for (int i = 0; i < gameArgs[0]; i++)
                 pthread_join(teamBThreads[i], NULL);
 
@@ -449,16 +559,17 @@ int main(int argc, char *argv[]) {
             // [ ----- Deallocations ----- ]
             free(teamAMem);
             teamAMem = NULL;
-
             free(teamBMem);
             teamBMem = NULL;
-
             free(gameArgs);
             gameArgs = NULL;
+
+            printEndResults();
+            free(endResults);
+            endResults = NULL;
         }
 
         int mapCloseStatus = close(mapFd);
-        
         if (mapCloseStatus == -1)
             printf("%s\n", ERROR_MESSAGE);
 
