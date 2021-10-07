@@ -7,9 +7,18 @@
     VITALY important that this is run on a newer debian based Linux distribution
     such as Ubuntu 20.04 (which it was tested on).
 
-    To compile all that should be needed is GCC an to run the following command:
+    To compile all that should be needed is GCC and to run the following command:
     
         "gcc -o Lab3 Lab3.c -pthread"
+        
+    To run the simulation the following command structure should be passed:
+        
+        "./Lab3 <# Team A members> <# Team B members> <map rows> <map cols>"
+        
+        for example the following command would have 2 team A members, 3 team B members,
+        would be a 10x20 matrix:
+        
+        "./Lab3 2 3 10 20"
     
 [ABOUT FILE SECTION LOCKING]
     This program uses special OFD (open file descriptor) locks with fcntl() in order
